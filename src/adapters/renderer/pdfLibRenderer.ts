@@ -1,5 +1,5 @@
 import { writeFile } from "node:fs/promises";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, degrees } from "pdf-lib";
 import sharp from "sharp";
 import type { RendererPort, RenderPdfOptions } from "../../application/ports";
 import type { ImpositionJob } from "../../domain/models";
@@ -87,7 +87,17 @@ export class PdfLibRenderer implements RendererPort {
       const stickerH = mmToPt(placement.hMm);
 
       const embedded = await getEmbeddedPng(placement.assetId);
-      page.drawImage(embedded, { x, y, width: stickerW, height: stickerH });
+      if (placement.rotate90) {
+        page.drawImage(embedded, {
+          x,
+          y: y + stickerH,
+          width: stickerH,
+          height: stickerW,
+          rotate: degrees(-90),
+        });
+      } else {
+        page.drawImage(embedded, { x, y, width: stickerW, height: stickerH });
+      }
 
       if (options.drawBoxes) drawBoxLines(page, x, y, stickerW, stickerH);
       if (options.crosshair) drawCrosshair(page, x, y, stickerW, stickerH);

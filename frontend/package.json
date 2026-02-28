@@ -4,12 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -p tsconfig.json && vite build",
-    "preview": "vite preview"
+    "dev": "vite --config vite.config.ts",
+    "build": "tsc -p tsconfig.json && vite build --config vite.config.ts",
+    "preview": "vite preview --config vite.config.ts"
   },
   "dependencies": {
-    "pdf-lib": "^1.17.1"
+    "pdf-lib": "^1.17.1",
+    "sticker-imposer": "file:.."
   },
   "devDependencies": {
     "typescript": "^5.9.3",

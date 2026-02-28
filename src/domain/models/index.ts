@@ -82,6 +82,7 @@ export interface Placement {
   assetId: string;    // nombre/id del PNG
   wMm: Mm;
   hMm: Mm;
+  rotate90?: boolean; // true => rotado 90 grados horario
 }
 
 export interface ImpositionJob {
