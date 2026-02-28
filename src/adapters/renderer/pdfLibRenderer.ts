@@ -78,14 +78,13 @@ export class PdfLibRenderer implements RendererPort {
       }
     };
 
-    const stickerW = mmToPt(job.layout.stickerWmm);
-    const stickerH = mmToPt(job.layout.stickerHmm);
-
     for (const placement of job.placements) {
       const page = pages[placement.pageIndex];
 
       const x = mmToPt(placement.xMm);
       const y = mmToPt(placement.yMm);
+      const stickerW = mmToPt(placement.wMm);
+      const stickerH = mmToPt(placement.hMm);
 
       const embedded = await getEmbeddedPng(placement.assetId);
       page.drawImage(embedded, { x, y, width: stickerW, height: stickerH });

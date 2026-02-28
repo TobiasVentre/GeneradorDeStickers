@@ -3,14 +3,23 @@ import { readdir, mkdir } from "node:fs/promises";
 import { join, basename } from "node:path";
 
 import { FsPngCatalog } from "../catalog/fsPngCatalog";
-import { imposeFolder } from "../../application/usecases/imposeFolder";
+import { imposeFromSpec } from "../../application/usecases/imposeFolder";
 import { PdfLibRenderer } from "../renderer/pdfLibRenderer";
 
 import { CsvOrderWriter } from "../persistence/csvOrderWriter";
-import { readExecutionCsv } from "../persistence/csvExecutionReader";
+import { CsvExecutionReader } from "../persistence/csvExecutionReader";
+import {
+  ALGO_GRID_V1,
+  ALGO_SHELF_MIXED_V1,
+  DEFAULT_ALGO_VERSION,
+  DEFAULT_DPI,
+  DEFAULT_EXECUTION_SPEC_VERSION,
+  ExecutionSpec,
+  defaultExecutionSheet,
+} from "../../domain/models";
 
-const BASE_FOLDER = "C:\\Users\\Usuario\\stickers"; // carpeta “raíz” donde tenés subcarpetas con PNGs
-const OUTPUTS_DIR = "C:\\Users\\Usuario\\stickers\\outputs"; // outputs sueltos acá
+const BASE_FOLDER = "C:\\Users\\Usuario\\stickers"; // carpeta raiz donde tenes subcarpetas con PNGs
+const OUTPUTS_DIR = "C:\\Users\\Usuario\\stickers\\outputs"; // outputs sueltos aca
 
 function ask(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -35,12 +44,24 @@ function nowTimestamp(): string {
     .slice(0, 19);
 }
 
+function nowIsoNoMs(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function toPositiveNumberOrThrow(value: string, label: string): number {
+  const n = Number(String(value ?? "").trim());
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${label} invalido. Debe ser un numero > 0.`);
+  }
+  return n;
+}
+
 async function ensureOutputsDir(): Promise<void> {
   await mkdir(OUTPUTS_DIR, { recursive: true });
 }
 
 async function chooseFolder(): Promise<string> {
-  console.log(`\n📂 Buscando carpetas en: ${BASE_FOLDER}\n`);
+  console.log(`\nBuscando carpetas en: ${BASE_FOLDER}\n`);
 
   const entries = await readdir(BASE_FOLDER, { withFileTypes: true });
   const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
@@ -51,10 +72,10 @@ async function chooseFolder(): Promise<string> {
 
   dirs.forEach((d, i) => console.log(`${i + 1}) ${d}`));
 
-  const choice = Number(await ask("\nElegí una carpeta (número): "));
+  const choice = Number(await ask("\nElegi una carpeta (numero): "));
 
   if (!choice || choice < 1 || choice > dirs.length) {
-    throw new Error("Selección inválida.");
+    throw new Error("Seleccion invalida.");
   }
 
   return join(BASE_FOLDER, dirs[choice - 1]);
@@ -65,7 +86,7 @@ async function chooseCsvFromOutputsRoot(): Promise<string> {
 
   const entries = await readdir(OUTPUTS_DIR, { withFileTypes: true });
 
-  // CSVs en la raíz: pedido_*.csv
+  // CSVs en la raiz: pedido_*.csv
   const csvs = entries
     .filter((e) => e.isFile())
     .map((e) => e.name)
@@ -78,13 +99,13 @@ async function chooseCsvFromOutputsRoot(): Promise<string> {
     throw new Error(`No hay CSVs en: ${OUTPUTS_DIR}`);
   }
 
-  console.log(`\n🧾 CSVs disponibles en: ${OUTPUTS_DIR}\n`);
+  console.log(`\nCSVs disponibles en: ${OUTPUTS_DIR}\n`);
   csvs.forEach((f, i) => console.log(`${i + 1}) ${f}`));
 
-  const choice = Number(await ask("\nElegí un CSV (número): "));
+  const choice = Number(await ask("\nElegi un CSV (numero): "));
 
   if (!choice || choice < 1 || choice > csvs.length) {
-    throw new Error("Selección inválida.");
+    throw new Error("Seleccion invalida.");
   }
 
   return join(OUTPUTS_DIR, csvs[choice - 1]);
@@ -96,38 +117,100 @@ async function runNewExecution(): Promise<void> {
   const folderPath = await chooseFolder();
   const folderName = basename(folderPath);
 
-  console.log(`\n📁 Usando carpeta: ${folderPath}`);
+  console.log(`\nUsando carpeta: ${folderPath}`);
 
   const catalog = new FsPngCatalog();
-  const assets = await catalog.listPngAssets(folderPath);
+  const assets = (await catalog.listPngAssets(folderPath)).slice().sort((a, b) => {
+    return a.assetId.localeCompare(b.assetId);
+  });
 
-  console.log(`\nEncontré ${assets.length} PNG(s):`);
+  console.log(`\nEncontre ${assets.length} PNG(s):`);
   assets.forEach((a) => console.log(`- ${a.assetId} (${a.widthPx}x${a.heightPx}px)`));
 
-  console.log("\nIngresá cantidades por archivo:");
+  console.log("\nMotor de imposicion:");
+  console.log("1) Grilla uniforme (mismo tamano para todos)");
+  console.log("2) Mixed simple (tamanos por PNG, sin optimizacion)\n");
 
-  const items: Array<{ assetId: string; qty: number }> = [];
-  for (const a of assets) {
-    const qty = toIntOrZero(await ask(`${a.assetId} -> cantidad? `));
-    items.push({ assetId: a.assetId, qty });
+  const engineChoice = Number(await ask("Elegi (1/2): "));
+  const algoVersion = engineChoice === 2 ? ALGO_SHELF_MIXED_V1 : ALGO_GRID_V1;
+
+  const items: ExecutionSpec["quantities"] = [];
+
+  if (algoVersion === ALGO_SHELF_MIXED_V1) {
+    console.log("\nIngresa tamano (cm) y cantidad por archivo:");
+    for (const a of assets) {
+      const axisRaw = (await ask(`${a.assetId} -> usar ancho o alto? (w/h): `)).trim().toLowerCase();
+      if (axisRaw !== "w" && axisRaw !== "h") {
+        throw new Error("Opcion invalida. Usa 'w' o 'h'.");
+      }
+      const sizeCm = toPositiveNumberOrThrow(await ask(`  ${axisRaw === "w" ? "Ancho" : "Alto"} (cm): `), "Tamano");
+      const qty = toIntOrZero(await ask(`  ${a.assetId} -> cantidad? `));
+      items.push({
+        assetId: a.assetId,
+        qty,
+        sizing: { mode: "physical", axis: axisRaw, sizeCm },
+      });
+    }
+  } else {
+    console.log("\nIngresa cantidades por archivo:");
+    for (const a of assets) {
+      const qty = toIntOrZero(await ask(`${a.assetId} -> cantidad? `));
+      items.push({ assetId: a.assetId, qty });
+    }
   }
 
-  const dpi = 300;
+  let stickerSizing: ExecutionSpec["stickerSizing"];
+  if (algoVersion === ALGO_SHELF_MIXED_V1) {
+    stickerSizing = { mode: "perAsset" };
+  } else {
+    console.log("\nEstrategia de tamano de sticker:");
+    console.log("1) Tamano manual (cm)");
+    console.log("2) Respetar DPI de imagen\n");
 
-  const result = await imposeFolder({
+    const sizingChoice = Number(await ask("Elegi (1/2): "));
+    if (sizingChoice === 1) {
+      const wCm = toPositiveNumberOrThrow(await ask("Ancho (cm): "), "Ancho");
+      const hCm = toPositiveNumberOrThrow(await ask("Alto (cm): "), "Alto");
+      stickerSizing = { mode: "physical", wCm, hCm };
+    } else if (sizingChoice === 2) {
+      stickerSizing = { mode: "fromImageDpi" };
+    } else {
+      throw new Error("Opcion invalida.");
+    }
+  }
+
+  const sheetDefaults = defaultExecutionSheet();
+  const spec: ExecutionSpec = {
+    specVersion: DEFAULT_EXECUTION_SPEC_VERSION,
+    timestamp: nowIsoNoMs(),
     folderPath,
-    catalog,
+    dpi: DEFAULT_DPI,
+    sheet: {
+      wCm: sheetDefaults.wCm,
+      hCm: sheetDefaults.hCm,
+      gapMm: sheetDefaults.gapMm,
+      marginMm: sheetDefaults.marginMm,
+    },
+    stickerSizing,
     quantities: items,
-    dpi,
+    algoVersion,
+  };
+
+  const result = await imposeFromSpec({
+    catalog,
+    spec,
   });
 
   const { job, totalPlaced, totalPages } = result;
 
   console.log("\n=== RESUMEN ===");
-  console.log(`Sticker: ${(job.layout.stickerWmm / 10).toFixed(2)} cm`);
-  console.log(`Entran por pliego: ${job.layout.capacityPerPage}`);
+  console.log(`Motor: ${job.engineId}`);
+  if (job.layout) {
+    console.log(`Sticker: ${(job.layout.stickerWmm / 10).toFixed(2)} cm`);
+    console.log(`Entran por pliego: ${job.layout.capacityPerPage}`);
+  }
   console.log(`Total pedidos: ${totalPlaced}`);
-  console.log(`Páginas necesarias: ${totalPages}`);
+  console.log(`Paginas necesarias: ${totalPages}`);
 
   const ts = nowTimestamp();
 
@@ -154,7 +237,7 @@ async function runNewExecution(): Promise<void> {
     },
   });
 
-  console.log(`\n✅ PDF generado correctamente:\n${outputPdfPath}`);
+  console.log(`\nPDF generado correctamente:\n${outputPdfPath}`);
 
   // =========================
   // CSV (metadata + items)
@@ -162,73 +245,50 @@ async function runNewExecution(): Promise<void> {
   const csvWriter = new CsvOrderWriter();
 
   await csvWriter.writeExecutionCsv({
-    // ✅ clave correcta según tu tipo: csvPath
     csvPath: outputCsvPath,
-    // ✅ clave correcta según tu tipo: summary
-    summary: {
-      timestamp: ts,
-      folderPath,
-      outputPdfPath,
-      sheetWcm: job.sheet.sheetWmm / 10,
-      sheetHcm: job.sheet.sheetHmm / 10,
-      gapMm: job.sheet.gapMm,
-      marginMm: job.sheet.marginMm,
-      dpi,
-      capacityPerPage: job.layout.capacityPerPage,
-      totalPlaced,
-      totalPages,
-      // ✅ usar "items" (coincide con tu reader)
-      items,
-    },
+    spec,
   });
 
-  console.log(`✅ CSV generado:\n${outputCsvPath}`);
-  console.log(`\n📦 Output guardado en:\n${OUTPUTS_DIR}`);
+  console.log(`CSV generado:\n${outputCsvPath}`);
+  console.log(`\nOutput guardado en:\n${OUTPUTS_DIR}`);
 }
 
 async function runFromExistingCsv(): Promise<void> {
   await ensureOutputsDir();
 
   const csvPath = await chooseCsvFromOutputsRoot();
-  console.log(`\n📄 Usando CSV:\n${csvPath}`);
+  console.log(`\nUsando CSV:\n${csvPath}`);
 
-  // ✅ tu reader real es una FUNCIÓN
-  const exec = await readExecutionCsv(csvPath);
+  const reader = new CsvExecutionReader();
+  const spec = await reader.read(csvPath);
 
-  const folderPath = exec.folderPath;
+  const folderPath = spec.folderPath;
   const folderName = basename(folderPath);
 
   const catalog = new FsPngCatalog();
-  const assets = await catalog.listPngAssets(folderPath);
-
-  const assetPathById: Record<string, string> = {};
-  assets.forEach((a) => (assetPathById[a.assetId] = a.filePath));
-
-  const result = await imposeFolder({
-    folderPath,
+  const result = await imposeFromSpec({
     catalog,
-    // ✅ tu reader devuelve exec.items
-    quantities: exec.items,
-    dpi: exec.dpi,
-    // Si tu usecase acepta sheet/gap/margin, pasalos acá:
-    // sheetWcm: exec.sheetWcm,
-    // sheetHcm: exec.sheetHcm,
-    // gapMm: exec.gapMm,
-    // marginMm: exec.marginMm,
+    spec,
   });
 
   const { job, totalPlaced, totalPages } = result;
 
-  console.log("\n=== RESUMEN (RE-EJECUCIÓN) ===");
-  console.log(`Sticker: ${(job.layout.stickerWmm / 10).toFixed(2)} cm`);
-  console.log(`Entran por pliego: ${job.layout.capacityPerPage}`);
+  console.log("\n=== RESUMEN (RE-EJECUCION) ===");
+  console.log(`Motor: ${job.engineId}`);
+  if (job.layout) {
+    console.log(`Sticker: ${(job.layout.stickerWmm / 10).toFixed(2)} cm`);
+    console.log(`Entran por pliego: ${job.layout.capacityPerPage}`);
+  }
   console.log(`Total pedidos: ${totalPlaced}`);
-  console.log(`Páginas necesarias: ${totalPages}`);
+  console.log(`Paginas necesarias: ${totalPages}`);
 
   const renderer = new PdfLibRenderer();
 
   const ts = nowTimestamp();
   const outputPdfPath = join(OUTPUTS_DIR, `pliego_${folderName}_reprint_${ts}.pdf`);
+
+  const assetPathById: Record<string, string> = {};
+  result.assets.forEach((a) => (assetPathById[a.assetId] = a.filePath));
 
   await renderer.renderPdf({
     job,
@@ -240,18 +300,18 @@ async function runFromExistingCsv(): Promise<void> {
     },
   });
 
-  console.log(`\n✅ PDF generado correctamente (sin CSV):\n${outputPdfPath}`);
-  console.log(`\n📦 Output guardado en:\n${OUTPUTS_DIR}`);
+  console.log(`\nPDF generado correctamente (sin CSV):\n${outputPdfPath}`);
+  console.log(`\nOutput guardado en:\n${OUTPUTS_DIR}`);
 }
 
 export async function runCli(): Promise<void> {
-  console.log("\n🚀 Sticker Imposer iniciado\n");
+  console.log("\nSticker Imposer iniciado\n");
 
-  console.log("¿Qué querés hacer?");
-  console.log("1) Nueva ejecución (wizard + genera PDF y CSV)");
+  console.log("Que queres hacer?");
+  console.log("1) Nueva ejecucion (wizard + genera PDF y CSV)");
   console.log("2) Re-ejecutar desde un CSV existente (genera SOLO PDF)\n");
 
-  const choice = Number(await ask("Elegí (1/2): "));
+  const choice = Number(await ask("Elegi (1/2): "));
 
   if (choice === 1) {
     await runNewExecution();
@@ -263,5 +323,5 @@ export async function runCli(): Promise<void> {
     return;
   }
 
-  throw new Error("Opción inválida.");
+  throw new Error("Opcion invalida.");
 }

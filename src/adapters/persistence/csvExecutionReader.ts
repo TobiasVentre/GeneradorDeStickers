@@ -1,40 +1,107 @@
 import { readFile } from "node:fs/promises";
+import {
+  DEFAULT_ALGO_VERSION,
+  DEFAULT_DPI,
+  DEFAULT_EXECUTION_SPEC_VERSION,
+  ExecutionSpecItem,
+  ExecutionSpec,
+  ExecutionSpecVersion,
+  StickerSizing,
+  defaultExecutionSheet,
+  defaultStickerSizing,
+} from "../../domain/models";
 
-export interface ExecutionCsvData {
-  timestamp: string;
-  folderPath: string;
-  sheetWcm: number;
-  sheetHcm: number;
-  gapMm: number;
-  marginMm: number;
-  dpi: number;
-  marginMmMaybe?: number; // compat si falta
-  items: Array<{ assetId: string; qty: number }>;
-}
+function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let cur = "";
+  let inQuotes = false;
 
-function unquote(s: string): string {
-  const t = s.trim();
-  if (t.startsWith('"') && t.endsWith('"')) {
-    // CSV: "" significa una comilla literal
-    return t.slice(1, -1).replace(/""/g, '"');
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (inQuotes) {
+      if (ch === '"') {
+        const next = line[i + 1];
+        if (next === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+      continue;
+    }
+
+    if (ch === ",") {
+      fields.push(cur);
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
   }
-  return t;
+
+  fields.push(cur);
+  return fields;
 }
 
-function parseKVLine(line: string): { k: string; v: string } | null {
-  const trimmed = line.trim();
-  if (!trimmed) return null;
-
-  // Esperamos: "key","value"
-  const parts = trimmed.split(",");
-  if (parts.length < 2) return null;
-
-  const k = unquote(parts[0]);
-  const v = unquote(parts.slice(1).join(",")); // por si el value contiene comas
-  return { k, v };
+function cleanKey(key: string): string {
+  return key.replace(/^\uFEFF/, "").trim();
 }
 
-export async function readExecutionCsv(csvPath: string): Promise<ExecutionCsvData> {
+function toNumber(v: string | undefined, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeSpec(meta: Record<string, string>, quantities: ExecutionSpecItem[]): ExecutionSpec {
+  const sheetDefaults = defaultExecutionSheet();
+  const sizingDefaults = defaultStickerSizing();
+  const defaultSizingWcm = sizingDefaults.mode === "physical" ? sizingDefaults.wCm : 6;
+  const defaultSizingHcm = sizingDefaults.mode === "physical" ? sizingDefaults.hCm : 6;
+
+  const wCm = toNumber(meta["sheet.wCm"] ?? meta.sheetWcm, sheetDefaults.wCm);
+  const hCm = toNumber(meta["sheet.hCm"] ?? meta.sheetHcm, sheetDefaults.hCm);
+  const gapMm = toNumber(meta.gapMm, sheetDefaults.gapMm);
+  const marginMm = toNumber(meta.marginMm, sheetDefaults.marginMm);
+
+  const specVersion = toNumber(meta.specVersion, DEFAULT_EXECUTION_SPEC_VERSION) as ExecutionSpecVersion;
+  const sizingMode = (meta["stickerSizing.mode"] ?? "").trim();
+  let stickerSizing: StickerSizing;
+  if (sizingMode === "fromImageDpi") {
+    stickerSizing = { mode: "fromImageDpi" };
+  } else if (sizingMode === "physical") {
+    stickerSizing = {
+      mode: "physical",
+      wCm: toNumber(meta["stickerSizing.wCm"], defaultSizingWcm),
+      hCm: toNumber(meta["stickerSizing.hCm"], defaultSizingHcm),
+    };
+  } else if (sizingMode === "perAsset") {
+    stickerSizing = { mode: "perAsset" };
+  } else {
+    stickerSizing = sizingDefaults;
+  }
+
+  return {
+    specVersion,
+    timestamp: meta.timestamp ?? "",
+    folderPath: meta.folderPath ?? "",
+    dpi: toNumber(meta.dpi, DEFAULT_DPI),
+    sheet: { wCm, hCm, gapMm, marginMm },
+    stickerSizing,
+    quantities,
+    algoVersion: meta.algoVersion ?? DEFAULT_ALGO_VERSION,
+  };
+}
+
+export async function readExecutionCsv(csvPath: string): Promise<ExecutionSpec> {
   const raw = await readFile(csvPath, "utf-8");
   const lines = raw.split(/\r?\n/);
 
@@ -48,60 +115,83 @@ export async function readExecutionCsv(csvPath: string): Promise<ExecutionCsvDat
       i++; // saltar línea vacía
       break;
     }
-    const kv = parseKVLine(line);
-    if (kv) meta[kv.k] = kv.v;
+
+    const parts = parseCsvLine(line);
+    if (parts.length < 2) continue;
+
+    const key = cleanKey(parts[0]);
+    const value = parts.slice(1).join(",").trim();
+    if (key) meta[key] = value;
   }
 
   // 2) Buscar header assetId,qty
+  let header: string[] | null = null;
   for (; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    const a = unquote(line.split(",")[0]).toLowerCase();
+
+    const parts = parseCsvLine(line);
+    const a = cleanKey(parts[0] ?? "").toLowerCase();
     if (a === "assetid") {
+      header = parts.map((p) => cleanKey(p));
       i++; // pasar a datos
       break;
     }
   }
 
   // 3) Leer items
-  const items: Array<{ assetId: string; qty: number }> = [];
+  const items: ExecutionSpecItem[] = [];
+  const headerLower = (header ?? []).map((h) => h.toLowerCase());
+  const idxAsset = headerLower.indexOf("assetid");
+  const idxQty = headerLower.indexOf("qty");
+  const idxSizeAxis = headerLower.indexOf("sizeaxis");
+  const idxSizeCm = headerLower.indexOf("sizecm");
+
   for (; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
-    const parts = line.split(",");
+    const parts = parseCsvLine(line);
     if (parts.length < 2) continue;
 
-    const assetId = unquote(parts[0]);
-    const qtyStr = unquote(parts.slice(1).join(","));
+    const assetId = (parts[idxAsset >= 0 ? idxAsset : 0] ?? "").trim();
+    const qtyStr = (parts[idxQty >= 0 ? idxQty : 1] ?? "").trim();
     const qty = Math.max(0, Math.trunc(Number(qtyStr)));
 
-    items.push({ assetId, qty });
+    let sizing: ExecutionSpecItem["sizing"] | undefined;
+    const axisRaw = (idxSizeAxis >= 0 ? parts[idxSizeAxis] : "").trim().toLowerCase();
+    const sizeCmRaw = (idxSizeCm >= 0 ? parts[idxSizeCm] : "").trim();
+    const sizeCm = Number(sizeCmRaw);
+
+    if (axisRaw === "w" || axisRaw === "h") {
+      if (Number.isFinite(sizeCm) && sizeCm > 0) {
+        sizing = { mode: "physical", axis: axisRaw, sizeCm };
+      }
+    } else if (axisRaw === "dpi") {
+      sizing = { mode: "fromImageDpi" };
+    }
+
+    if (assetId) {
+      const item: ExecutionSpecItem = { assetId, qty };
+      if (sizing) item.sizing = sizing;
+      items.push(item);
+    }
   }
 
-  const sheetWcm = Number(meta.sheetWcm ?? 100);
-  const sheetHcm = Number(meta.sheetHcm ?? 50);
-  const gapMm = Number(meta.gapMm ?? 3);
-  const marginMm = Number(meta.marginMm ?? 0);
-  const dpi = Number(meta.dpi ?? 300);
+  const spec = normalizeSpec(meta, items);
 
-  return {
-    timestamp: meta.timestamp ?? "",
-    folderPath: meta.folderPath ?? "",
-    sheetWcm,
-    sheetHcm,
-    gapMm,
-    marginMm,
-    dpi,
-    items,
-  };
+  if (!spec.folderPath) {
+    throw new Error("CSV inválido: falta folderPath en metadata.");
+  }
+
+  return spec;
 }
 
 /**
  * Wrapper OO para que el CLI pueda importar `CsvExecutionReader`.
  */
 export class CsvExecutionReader {
-  async read(csvPath: string): Promise<ExecutionCsvData> {
+  async read(csvPath: string): Promise<ExecutionSpec> {
     return readExecutionCsv(csvPath);
   }
 }

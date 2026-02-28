@@ -1,4 +1,4 @@
-import type { ImpositionJob } from "../../domain/models";
+import type { ExecutionSpec, ImpositionJob } from "../../domain/models";
 
 // ===== Catalog (leer PNGs desde FS, etc.) =====
 export interface PngAssetInfo {
@@ -26,24 +26,6 @@ export interface RendererPort {
     options?: RenderPdfOptions;
   }): Promise<void>;
 }
-export interface ExecutionSummary {
-  timestamp: string;
-  folderPath: string;
-  outputPdfPath: string;
-
-  sheetWcm: number;
-  sheetHcm: number;
-  gapMm: number;
-  marginMm: number;
-  dpi: number;
-
-  capacityPerPage: number;
-  totalPlaced: number;
-  totalPages: number;
-
-  items: Array<{ assetId: string; qty: number }>;
-}
-
 export interface OrderWriterPort {
-  writeExecutionCsv(params: { csvPath: string; summary: ExecutionSummary }): Promise<void>;
+  writeExecutionCsv(params: { csvPath: string; spec: ExecutionSpec }): Promise<void>;
 }

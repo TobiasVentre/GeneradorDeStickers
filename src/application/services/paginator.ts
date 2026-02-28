@@ -35,7 +35,7 @@ export function paginateByBlocks(params: {
 
     const pageIndex = Math.floor(placedTotal / layout.capacityPerPage);
 
-    placements.push({ pageIndex, xMm, yMm, assetId });
+    placements.push({ pageIndex, xMm, yMm, assetId, wMm: layout.stickerWmm, hMm: layout.stickerHmm });
     placedTotal += 1;
   };
 
